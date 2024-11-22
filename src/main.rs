@@ -9,6 +9,8 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, MutexGuard, RwLock};
 use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 enum RedisResponse {
     OK(String),
@@ -89,23 +91,53 @@ impl RedisCommand {
 
 struct RedisData {
     data: HashMap<String, String>,
+    expiry: HashMap<String, std::time::Instant>,
 }
 
 impl RedisData {
     fn init_db() -> Self {
         Self {
             data: HashMap::new(),
+            expiry: HashMap::new(),
         }
     }
 
     fn set_value(&mut self, command: &RedisCommand) -> RedisResponse {
         self.data
             .insert(command.str_cmd[1].clone(), command.str_cmd[2].clone());
+        if command.cmd_len == 5 && command.str_cmd[3].as_str() == "px" {
+            let test_var = Instant::now()
+                + Duration::from_millis(
+                    command.str_cmd[4]
+                        .parse::<u64>()
+                        .expect("Parsing time failed!"),
+                );
+
+            self.expiry.insert(
+                command.str_cmd[1].clone(),
+                Instant::now()
+                    + Duration::from_millis(
+                        command.str_cmd[4]
+                            .parse::<u64>()
+                            .expect("Parsing time failed!"),
+                    ),
+            );
+        }
+
         RedisResponse::OK(String::from("OK"))
     }
 
-    fn get_value(&self, command: &RedisCommand) -> Option<String> {
+    fn get_value(&mut self, command: &RedisCommand) -> Option<String> {
         let key = &command.str_cmd[1];
+
+        if let Some(&expiry_time) = self.expiry.get(key) {
+            if Instant::now() > expiry_time {
+                self.data.remove(key);
+                self.expiry.remove(key);
+                return None;
+            }
+        }
+
         match self.data.get(key) {
             Some(value) => Some(value.clone()),
             None => None,
@@ -182,7 +214,7 @@ fn event_handler(stream: &mut TcpStream, db_instances: Arc<RwLock<RedisData>>) {
                 }
 
                 "get" => {
-                    let mut db = db_instances.read().unwrap();
+                    let mut db = db_instances.write().unwrap();
                     match db.get_value(&command) {
                         Some(string_return) => {
                             let parsed_return = command.format_response_code(Some(string_return));
