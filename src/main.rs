@@ -2,7 +2,9 @@
 use core::panic;
 use core::str;
 use std::collections::HashMap;
+use std::env;
 use std::error::Error;
+use std::hash::Hash;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
@@ -11,6 +13,61 @@ use std::sync::{Arc, MutexGuard, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+
+struct RedisConfig {
+    config: HashMap<String, String>,
+}
+
+impl RedisConfig {
+    fn parse_argument(mut args: Vec<String>) -> Self {
+        args.remove(0);
+        let mut config = HashMap::new();
+        let mut args_iter = args.iter().peekable();
+        let flags = ["--dir", "--dbfilename"];
+
+        while let Some(arg) = args_iter.next() {
+            if flags.contains(&arg.as_str()) {
+                match args_iter.peek() {
+                    Some(&next_args) if flags.contains(&next_args.as_str()) => {
+                        panic!("Missing value for the flag");
+                    }
+                    Some(&next_args) => {
+                        config.insert(arg.clone(), args_iter.next().unwrap().clone());
+                    }
+
+                    None => {
+                        panic!("Missing value for the flag");
+                    }
+                }
+            }
+        }
+        return Self { config };
+    }
+
+    fn set_config(&mut self, command: &RedisCommand) {}
+
+    fn get_config(&self, command: &RedisCommand) -> String {
+        // config get dir
+
+        let key = command.str_cmd[2].clone(); // get the key
+
+        let value = match self.config.get(&format!("--{}", &key)) {
+            Some(val) => val.clone(),
+            None => "".to_string(),
+        };
+
+        let lst_str = vec![key, value];
+        let base_str = format!("*{}\r\n", lst_str.len());
+
+        let formatted_item = lst_str
+            .iter()
+            .enumerate()
+            .map(|(i, item)| format!("${}\r\n{}\r\n", item.len(), item))
+            .collect::<String>();
+
+        return base_str + &formatted_item;
+    }
+}
 
 enum RedisResponse {
     OK(String),
@@ -106,13 +163,6 @@ impl RedisData {
         self.data
             .insert(command.str_cmd[1].clone(), command.str_cmd[2].clone());
         if command.cmd_len == 5 && command.str_cmd[3].as_str() == "px" {
-            let test_var = Instant::now()
-                + Duration::from_millis(
-                    command.str_cmd[4]
-                        .parse::<u64>()
-                        .expect("Parsing time failed!"),
-                );
-
             self.expiry.insert(
                 command.str_cmd[1].clone(),
                 Instant::now()
@@ -146,7 +196,14 @@ impl RedisData {
 }
 
 fn main() {
+    //env::set_var("RUST_BACKTRACE", "full");
+    let args: Vec<String> = env::args().collect();
+    let config_struct = RedisConfig::parse_argument(args);
+    //println!("{:?}", config_struct.config);
+    let config_settings = Arc::new(RwLock::new(config_struct));
+
     println!("Logs from your program will appear here!");
+
     let mut handles = vec![];
 
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
@@ -156,11 +213,13 @@ fn main() {
 
     for stream in listener.incoming() {
         let db_instances = Arc::clone(&db_instances);
+        let config_settings = Arc::clone(&config_settings);
+
         let handle = thread::spawn(move || match stream {
             Ok(mut stream) => {
                 println!("connected");
                 //let mut redis_db = db_instances.lock().unwrap();
-                event_handler(&mut stream, db_instances);
+                event_handler(&mut stream, db_instances, config_settings);
             }
             Err(e) => {
                 println!("error: {}", e);
@@ -174,8 +233,11 @@ fn main() {
     }
 }
 
-fn event_handler(stream: &mut TcpStream, db_instances: Arc<RwLock<RedisData>>) {
-    println!("event connected");
+fn event_handler(
+    stream: &mut TcpStream,
+    db_instances: Arc<RwLock<RedisData>>,
+    config_settings: Arc<RwLock<RedisConfig>>,
+) {
     let mut buf = [0; 1024];
     loop {
         let reader = stream.read(&mut buf).unwrap();
@@ -229,6 +291,27 @@ fn event_handler(stream: &mut TcpStream, db_instances: Arc<RwLock<RedisData>>) {
                         }
                     };
                 }
+
+                "config" => {
+                    if let Some(config_cmd) = command.str_cmd.get(1) {
+                        match config_cmd.as_str() {
+                            "get" => {
+                                let config = config_settings.read().unwrap();
+                                let get_string = config.get_config(&command);
+                                println!("{:?}", get_string);
+
+                                stream
+                                    .write_all(get_string.as_bytes())
+                                    .expect("failed to write to client");
+                            }
+
+                            "set" => {}
+
+                            _ => {}
+                        }
+                    }
+                }
+
                 _ => {}
             }
         }
