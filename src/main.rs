@@ -4,15 +4,19 @@ use core::str;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::fs;
+use std::fs::read;
 use std::hash::Hash;
+use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
-use std::sync::{Arc, MutexGuard, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::u64;
 
 struct RedisConfig {
     config: HashMap<String, String>,
@@ -32,7 +36,13 @@ impl RedisConfig {
                         panic!("Missing value for the flag");
                     }
                     Some(&next_args) => {
-                        config.insert(arg.clone(), args_iter.next().unwrap().clone());
+                        //let mut string_final = next_args.clone();
+                        //
+                        //if arg.as_str() == "--dir" && !next_args.ends_with("/") {
+                        //    string_final.push('/');
+                        //}
+
+                        config.insert(arg.clone(), next_args.clone());
                     }
 
                     None => {
@@ -41,6 +51,7 @@ impl RedisConfig {
                 }
             }
         }
+        println!("{:?}", config);
         return Self { config };
     }
 
@@ -61,8 +72,7 @@ impl RedisConfig {
 
         let formatted_item = lst_str
             .iter()
-            .enumerate()
-            .map(|(i, item)| format!("${}\r\n{}\r\n", item.len(), item))
+            .map(|item| format!("${}\r\n{}\r\n", item.len(), item))
             .collect::<String>();
 
         return base_str + &formatted_item;
@@ -93,19 +103,30 @@ struct RedisCommand {
 impl RedisCommand {
     fn parser_receive(command_str: &str) -> Result<Self, String> {
         let mut lines = command_str.split("\r\n").filter(|x| !x.is_empty());
-        let mut cmd_len = 0;
+
+        //let mut cmd_len = 0;
         let mut n_chars_len = Vec::new();
         let mut str_cmd = Vec::new();
+        let cmd_len = if let Some(line) = lines.next() {
+            if line.starts_with('*') {
+                line[1..]
+                    .parse::<i32>()
+                    .expect("Failed to parse command length")
+            } else {
+                return Err("Invalid command format: expected '*'".to_string());
+            }
+        } else {
+            return Err("Command string is empty".to_string());
+        };
 
         while let Some(line) = lines.next() {
             match line.chars().next() {
-                Some('*') => {
-                    cmd_len = line
-                        .trim_start_matches('*')
-                        .parse::<i32>()
-                        .expect("Failed to parse command length");
-                }
-
+                //Some('*') => {
+                //    cmd_len = line
+                //        .trim_start_matches('*')
+                //        .parse::<i32>()
+                //        .expect("Failed to parse command length");
+                //}
                 Some('$') => {
                     n_chars_len.push(
                         line.trim_start_matches('$')
@@ -159,6 +180,97 @@ impl RedisData {
         }
     }
 
+    fn read_from_file(&mut self, rconfig: &RedisConfig) -> RedisResponse {
+        let mut dir = match rconfig.config.get("--dir") {
+            Some(val) => val.clone(),
+            None => {
+                return RedisResponse::Error("No directory!".to_string());
+            }
+        };
+
+        let file = match rconfig.config.get("--dbfilename") {
+            Some(val) => val,
+            None => {
+                return RedisResponse::Error("No file!".to_string());
+            }
+        };
+
+        if !dir.ends_with("/") {
+            dir.push('/');
+        }
+
+        let file_path = dir.clone() + file;
+
+        println!("{:?}", file_path);
+
+        let content = match fs::read(&file_path) {
+            Ok(file) => file,
+            Err(e) => {
+                //eprintln!("Error: {e}");
+                return RedisResponse::Error(format!("{}", e));
+            }
+        };
+        let mut cursor = 0;
+        let mut in_rdb_content = false;
+
+        while cursor < content.len() {
+            if content[cursor] == 0xFE {
+                in_rdb_content = true;
+                cursor += 1;
+                let db_index = content[cursor];
+                println!("Database Index: {}", db_index);
+                cursor += 1;
+            } else if in_rdb_content {
+                match content[cursor] {
+                    0xFB => {
+                        // Hash table information
+                        cursor += 1;
+                        let hash_table_size = content[cursor];
+                        cursor += 1;
+                        let expires_size = content[cursor];
+                        cursor += 1;
+                        //println!("Hash Table Size: {}", hash_table_size);
+                        //println!("Expires Size: {}", expires_size);
+                    }
+
+                    0x00 => {
+                        // Get key and values (type string)
+                        cursor += 1;
+                        let key_len = content[cursor];
+                        cursor += 1;
+                        let keys =
+                            str::from_utf8(&content[cursor..cursor + key_len as usize]).unwrap();
+                        cursor += key_len as usize;
+
+                        let value_len = content[cursor];
+                        cursor += 1;
+                        let values =
+                            str::from_utf8(&content[cursor..cursor + value_len as usize]).unwrap();
+                        cursor += value_len as usize;
+                        self.data.insert(keys.to_string(), values.to_string());
+                        //println!("Key: {}, Value: {}", keys, values);
+                    }
+
+                    0xFC => {
+                        cursor += 1;
+                        let mut timestamp = content[cursor..cursor + 8].to_vec();
+                        timestamp.reverse();
+                        let timestamp_ms = u64::from_be_bytes(timestamp.try_into().unwrap());
+                        //println!("time in ms: {:?}", timestamp_ms);
+                    }
+
+                    _ => {
+                        cursor += 1;
+                    }
+                }
+            } else {
+                cursor += 1;
+            };
+        }
+
+        return RedisResponse::OK("OK".to_string());
+    }
+
     fn set_value(&mut self, command: &RedisCommand) -> RedisResponse {
         self.data
             .insert(command.str_cmd[1].clone(), command.str_cmd[2].clone());
@@ -193,23 +305,33 @@ impl RedisData {
             None => None,
         }
     }
+
+    fn get_all_keys(&self) -> Option<Vec<String>> {
+        let keys = self.data.clone().into_keys().collect::<Vec<String>>();
+        if keys.len() == 0 {
+            None
+        } else {
+            Some(keys)
+        }
+    }
 }
 
 fn main() {
     //env::set_var("RUST_BACKTRACE", "full");
     let args: Vec<String> = env::args().collect();
     let config_struct = RedisConfig::parse_argument(args);
-    //println!("{:?}", config_struct.config);
+    let mut redis_data = RedisData::init_db();
+
+    let read_file = redis_data.read_from_file(&config_struct);
+
     let config_settings = Arc::new(RwLock::new(config_struct));
+    let db_instances = Arc::new(RwLock::new(redis_data));
 
     println!("Logs from your program will appear here!");
 
     let mut handles = vec![];
 
     let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-
-    let redis_data = RedisData::init_db();
-    let db_instances = Arc::new(RwLock::new(redis_data));
 
     for stream in listener.incoming() {
         let db_instances = Arc::clone(&db_instances);
@@ -299,13 +421,48 @@ fn event_handler(
                                 let config = config_settings.read().unwrap();
                                 let get_string = config.get_config(&command);
                                 println!("{:?}", get_string);
-
                                 stream
                                     .write_all(get_string.as_bytes())
                                     .expect("failed to write to client");
                             }
 
                             "set" => {}
+
+                            _ => {}
+                        }
+                    }
+                }
+
+                "keys" => {
+                    let db = db_instances.read().unwrap();
+                    if let Some(config_cmd) = command.str_cmd.get(1) {
+                        match config_cmd.as_str() {
+                            "*" => {
+                                let lst_of_keys = match db.get_all_keys() {
+                                    Some(vec_str) => vec_str,
+                                    None => {
+                                        let final_str = format!("*0\r\n");
+
+                                        stream
+                                            .write_all(final_str.as_bytes())
+                                            .expect("failed to write to client");
+                                        return;
+                                    }
+                                };
+
+                                let base_str = format!("*{}\r\n", lst_of_keys.len());
+
+                                let formatted_item = lst_of_keys
+                                    .iter()
+                                    .map(|item| format!("${}\r\n{}\r\n", item.len(), item))
+                                    .collect::<String>();
+
+                                let final_str = base_str + &formatted_item;
+
+                                stream
+                                    .write_all(final_str.as_bytes())
+                                    .expect("failed to write to client");
+                            }
 
                             _ => {}
                         }
