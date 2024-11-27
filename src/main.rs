@@ -14,8 +14,7 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::u64;
 
 struct RedisConfig {
@@ -121,12 +120,6 @@ impl RedisCommand {
 
         while let Some(line) = lines.next() {
             match line.chars().next() {
-                //Some('*') => {
-                //    cmd_len = line
-                //        .trim_start_matches('*')
-                //        .parse::<i32>()
-                //        .expect("Failed to parse command length");
-                //}
                 Some('$') => {
                     n_chars_len.push(
                         line.trim_start_matches('$')
@@ -169,7 +162,7 @@ impl RedisCommand {
 
 struct RedisData {
     data: HashMap<String, String>,
-    expiry: HashMap<String, std::time::Instant>,
+    expiry: HashMap<String, std::time::SystemTime>,
 }
 
 impl RedisData {
@@ -177,6 +170,134 @@ impl RedisData {
         Self {
             data: HashMap::new(),
             expiry: HashMap::new(),
+        }
+    }
+
+    fn decode_length(&self, content: &Vec<u8>, cursor: &mut usize) -> Option<usize> {
+        let first_byte = content[*cursor];
+        *cursor += 1;
+        //return Some(first_byte as usize);
+
+        match first_byte >> 6 {
+            0b00 => Some((first_byte & 0x3F) as usize), // 6-bit length
+            0b01 => {
+                if *cursor < content.len() {
+                    let second_byte = content[*cursor];
+                    *cursor += 1;
+                    Some((((first_byte & 0x3F) as usize) << 8) | (second_byte as usize))
+                // 14-bit length
+                } else {
+                    None
+                }
+            }
+            0b10 => {
+                if *cursor + 3 < content.len() {
+                    let mut length_bytes = [0u8; 4];
+                    length_bytes.copy_from_slice(&content[*cursor..*cursor + 4]);
+                    *cursor += 4;
+                    Some(u32::from_be_bytes(length_bytes) as usize) // 32-bit length
+                } else {
+                    None
+                }
+            }
+            0b11 => {
+                // Special encoding for integers or other data, handle separately
+                Some((first_byte & 0x3F) as usize) // You may need to modify for specific cases
+            }
+            _ => None,
+        }
+    }
+
+    fn read_values(&self, content: &Vec<u8>, cursor: &mut usize) -> Option<(String, String)> {
+        match content[*cursor] {
+            0x00 => {
+                // string
+                *cursor += 1;
+                let keys = self
+                    .read_string(content, cursor)
+                    .expect("Error reading the keys");
+                let values = self
+                    .read_string(content, cursor)
+                    .expect("Error reading the values");
+                Some((keys, values))
+            }
+            // other values to be implemented
+            _ => None,
+        }
+    }
+
+    fn read_string(&self, content: &Vec<u8>, cursor: &mut usize) -> Option<String> {
+        let length = self.decode_length(content, cursor)?;
+        if *cursor + length <= content.len() {
+            let string_data = &content[*cursor..*cursor + length];
+            *cursor += length;
+            Some(String::from_utf8_lossy(string_data).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn parse_db_key_val(&mut self, content: &Vec<u8>, cursor: &mut usize) {
+        *cursor += 1;
+        let size_table_all = content[*cursor];
+        println!("Table size all: {}", size_table_all);
+
+        *cursor += 1;
+        let size_table_expired = content[*cursor];
+        println!("Table size expired: {}", size_table_expired);
+
+        let size_table_no_expired = size_table_all - size_table_expired;
+
+        *cursor += 1;
+        //let tmp_cursor = cursor.clone();
+        for _ in 0..size_table_all {
+            match content[*cursor] {
+                0xFC => {
+                    *cursor += 1; // move 1 step toward the time stamp
+                    let mut timestamp = content[*cursor..*cursor + 8].to_vec();
+                    *cursor += 8; //skip the timestamp
+                    timestamp.reverse();
+                    let timestamp_ms = u64::from_be_bytes(timestamp.try_into().unwrap());
+                    let time = UNIX_EPOCH + Duration::from_millis(timestamp_ms);
+                    let (keys, values) = self
+                        .read_values(content, cursor)
+                        .expect("Error reading the keys and values");
+                    self.data.insert(keys.clone(), values.clone());
+                    self.expiry.insert(keys.clone(), time);
+                    println!(
+                        "Key: {}, Value: {}, timestamp: {}",
+                        keys, values, timestamp_ms
+                    );
+                }
+
+                0xFD => {
+                    *cursor += 1;
+                    let mut timestamp = content[*cursor..*cursor + 4].to_vec();
+                    *cursor += 8;
+                    timestamp.reverse();
+                    let timestamp_sec = u64::from_be_bytes(timestamp.try_into().unwrap());
+                    let time = UNIX_EPOCH + Duration::from_secs(timestamp_sec);
+                    println!("timestamp: {}", timestamp_sec);
+                    let (keys, values) = self
+                        .read_values(content, cursor)
+                        .expect("Error reading the keys and values");
+
+                    self.data.insert(keys.clone(), values.clone());
+                    self.expiry.insert(keys.clone(), time);
+                    println!(
+                        "Key: {}, Value: {}, timestamp: {}",
+                        keys, values, timestamp_sec
+                    );
+                }
+
+                _ => {
+                    let (keys, values) = self
+                        .read_values(content, cursor)
+                        .expect("Error reading the keys and values");
+                    self.data.insert(keys.clone(), values.clone());
+                    println!("Key: {}, Value: {}", keys, values);
+                }
+            }
         }
     }
 
@@ -201,8 +322,6 @@ impl RedisData {
 
         let file_path = dir.clone() + file;
 
-        println!("{:?}", file_path);
-
         let content = match fs::read(&file_path) {
             Ok(file) => file,
             Err(e) => {
@@ -213,59 +332,32 @@ impl RedisData {
         let mut cursor = 0;
         let mut in_rdb_content = false;
 
+        if str::from_utf8(&content[0..5]).unwrap() != "REDIS" {
+            return RedisResponse::Error("Magic string failed".to_string());
+        }
+
         while cursor < content.len() {
-            if content[cursor] == 0xFE {
-                in_rdb_content = true;
-                cursor += 1;
-                let db_index = content[cursor];
-                println!("Database Index: {}", db_index);
-                cursor += 1;
-            } else if in_rdb_content {
-                match content[cursor] {
-                    0xFB => {
-                        // Hash table information
-                        cursor += 1;
-                        let hash_table_size = content[cursor];
-                        cursor += 1;
-                        let expires_size = content[cursor];
-                        cursor += 1;
-                        //println!("Hash Table Size: {}", hash_table_size);
-                        //println!("Expires Size: {}", expires_size);
-                    }
-
-                    0x00 => {
-                        // Get key and values (type string)
-                        cursor += 1;
-                        let key_len = content[cursor];
-                        cursor += 1;
-                        let keys =
-                            str::from_utf8(&content[cursor..cursor + key_len as usize]).unwrap();
-                        cursor += key_len as usize;
-
-                        let value_len = content[cursor];
-                        cursor += 1;
-                        let values =
-                            str::from_utf8(&content[cursor..cursor + value_len as usize]).unwrap();
-                        cursor += value_len as usize;
-                        self.data.insert(keys.to_string(), values.to_string());
-                        //println!("Key: {}, Value: {}", keys, values);
-                    }
-
-                    0xFC => {
-                        cursor += 1;
-                        let mut timestamp = content[cursor..cursor + 8].to_vec();
-                        timestamp.reverse();
-                        let timestamp_ms = u64::from_be_bytes(timestamp.try_into().unwrap());
-                        //println!("time in ms: {:?}", timestamp_ms);
-                    }
-
-                    _ => {
-                        cursor += 1;
-                    }
+            match content[cursor] {
+                0xFA => {
+                    cursor += 1;
                 }
-            } else {
-                cursor += 1;
-            };
+
+                0xFB => {
+                    self.parse_db_key_val(&content, &mut cursor);
+                }
+
+                0xFE => {
+                    cursor += 1;
+                }
+
+                0xFF => {
+                    break;
+                }
+
+                _ => {
+                    cursor += 1;
+                }
+            }
         }
 
         return RedisResponse::OK("OK".to_string());
@@ -277,7 +369,7 @@ impl RedisData {
         if command.cmd_len == 5 && command.str_cmd[3].as_str() == "px" {
             self.expiry.insert(
                 command.str_cmd[1].clone(),
-                Instant::now()
+                SystemTime::now()
                     + Duration::from_millis(
                         command.str_cmd[4]
                             .parse::<u64>()
@@ -293,7 +385,7 @@ impl RedisData {
         let key = &command.str_cmd[1];
 
         if let Some(&expiry_time) = self.expiry.get(key) {
-            if Instant::now() > expiry_time {
+            if SystemTime::now() > expiry_time {
                 self.data.remove(key);
                 self.expiry.remove(key);
                 return None;
