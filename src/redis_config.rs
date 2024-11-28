@@ -10,7 +10,7 @@ impl RedisConfig {
         args.remove(0);
         let mut config = HashMap::new();
         let mut args_iter = args.iter().peekable();
-        let flags = ["--dir", "--dbfilename"];
+        let flags = ["--dir", "--dbfilename", "--port"];
 
         while let Some(arg) = args_iter.next() {
             if flags.contains(&arg.as_str()) {
@@ -19,12 +19,6 @@ impl RedisConfig {
                         panic!("Missing value for the flag");
                     }
                     Some(&next_args) => {
-                        //let mut string_final = next_args.clone();
-                        //
-                        //if arg.as_str() == "--dir" && !next_args.ends_with("/") {
-                        //    string_final.push('/');
-                        //}
-
                         config.insert(arg.clone(), next_args.clone());
                     }
 
@@ -36,6 +30,10 @@ impl RedisConfig {
         }
         println!("{:?}", config);
         return Self { config };
+    }
+
+    pub fn get_port(&self) -> Option<&String> {
+        self.config.get("--port")
     }
 
     pub fn set_config(&mut self, command: &RedisCommand) {}

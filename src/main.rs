@@ -98,14 +98,20 @@ fn main() {
 
     let read_file = redis_data.read_from_file(&config_struct);
 
-    let config_settings = Arc::new(RwLock::new(config_struct));
-    let db_instances = Arc::new(RwLock::new(redis_data));
-
     println!("Logs from your program will appear here!");
 
     let mut handles = vec![];
 
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let port = match config_struct.get_port() {
+        Some(port) => port.clone(),
+        None => "6379".to_string(),
+    };
+
+    let address = format!("127.0.0.1:{}", port);
+    let listener = TcpListener::bind(address).unwrap();
+
+    let config_settings = Arc::new(RwLock::new(config_struct));
+    let db_instances = Arc::new(RwLock::new(redis_data));
 
     for stream in listener.incoming() {
         let db_instances = Arc::clone(&db_instances);
