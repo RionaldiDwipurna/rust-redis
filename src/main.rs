@@ -94,8 +94,12 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     let config_struct = RedisConfig::parse_argument(args);
     let mut redis_data = RedisData::init_db();
+    //println!("{:?}", config_struct.config.get("--replicaof").unwrap());
 
     let read_file = redis_data.read_from_file(&config_struct);
+
+    //println!("database:");
+    //println!("{:?}", redis_data.data);
 
     println!("Logs from your program will appear here!");
 
@@ -275,7 +279,14 @@ async fn event_handler(
                 }
 
                 "info" => {
-                    let lst_info = vec!["role:master".to_string()];
+                    let config = config_settings.read().await;
+
+                    let role = match config.get_replicaof() {
+                        Some(value) => "slave".to_string(),
+                        None => "master".to_string(),
+                    };
+
+                    let lst_info = vec![format!("role:{}", role)];
                     let format_string = command.format_response_code(Some(lst_info[0].clone()));
                     //println!("{:?}", format_string);
                     stream

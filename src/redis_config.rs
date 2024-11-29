@@ -10,7 +10,7 @@ impl RedisConfig {
         args.remove(0);
         let mut config = HashMap::new();
         let mut args_iter = args.iter().peekable();
-        let flags = ["--dir", "--dbfilename", "--port"];
+        let flags = ["--dir", "--dbfilename", "--port", "--replicaof"];
 
         while let Some(arg) = args_iter.next() {
             if flags.contains(&arg.as_str()) {
@@ -34,6 +34,10 @@ impl RedisConfig {
 
     pub fn get_port(&self) -> Option<&String> {
         self.config.get("--port")
+    }
+
+    pub fn get_replicaof(&self) -> Option<&String> {
+        self.config.get("--replicaof")
     }
 
     pub fn set_config(&mut self, command: &RedisCommand) {}
