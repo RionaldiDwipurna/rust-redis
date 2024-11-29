@@ -8,14 +8,17 @@ use std::fs;
 use std::fs::read;
 use std::hash::Hash;
 use std::io;
-use std::io::Read;
-use std::io::Write;
-use std::net::TcpListener;
-use std::net::TcpStream;
+use std::io::{Read, Write};
+//use std::net::{TcpListener, TcpStream};
+use std::result::Result::Ok;
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::u64;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::RwLock as AsyncRwLock;
+use tokio::task;
 mod rdb;
 mod redis_config;
 use rdb::RedisData;
@@ -73,24 +76,20 @@ impl RedisCommand {
         let chars_len: Vec<i32>;
         let str_cmd_to_use = match input {
             Some(s) => {
-                chars_len = vec![0, s.len() as i32];
                 vec![s]
             }
-            None => {
-                chars_len = self.n_chars_len.clone();
-                self.str_cmd[1..].to_vec()
-            }
+            None => self.str_cmd[1..].to_vec(),
         };
 
         str_cmd_to_use
             .iter()
-            .enumerate()
-            .map(|(i, item)| format!("${}\r\n{}\r\n", chars_len[i + 1], item))
+            .map(|item| format!("${}\r\n{}\r\n", item.len(), item))
             .collect()
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     //env::set_var("RUST_BACKTRACE", "full");
     let args: Vec<String> = env::args().collect();
     let config_struct = RedisConfig::parse_argument(args);
@@ -100,7 +99,7 @@ fn main() {
 
     println!("Logs from your program will appear here!");
 
-    let mut handles = vec![];
+    //let mut handles = vec![];
 
     let port = match config_struct.get_port() {
         Some(port) => port.clone(),
@@ -108,41 +107,59 @@ fn main() {
     };
 
     let address = format!("127.0.0.1:{}", port);
-    let listener = TcpListener::bind(address).unwrap();
+    let listener = TcpListener::bind(&address)
+        .await
+        .expect("Failed to bind port");
 
-    let config_settings = Arc::new(RwLock::new(config_struct));
-    let db_instances = Arc::new(RwLock::new(redis_data));
+    //let db_instances = Arc::new(RwLock::new(redis_data));
+    //let config_settings = Arc::new(RwLock::new(config_struct));
 
-    for stream in listener.incoming() {
+    let config_settings = Arc::new(AsyncRwLock::new(config_struct));
+    let db_instances = Arc::new(AsyncRwLock::new(redis_data));
+
+    loop {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .expect("Failed to accept connection");
         let db_instances = Arc::clone(&db_instances);
         let config_settings = Arc::clone(&config_settings);
-
-        let handle = thread::spawn(move || match stream {
-            Ok(mut stream) => {
-                println!("connected");
-                //let mut redis_db = db_instances.lock().unwrap();
-                event_handler(&mut stream, db_instances, config_settings);
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
+        task::spawn(async move {
+            if let Err(e) = event_handler(&mut socket, db_instances, config_settings).await {
+                eprintln!("Failed to handle connection: {}", e);
+            };
         });
-        handles.push(handle);
     }
-
-    for handle in handles {
-        handle.join().unwrap();
-    }
+    //for stream in listener.incoming() {
+    //    let db_instances = Arc::clone(&db_instances);
+    //    let config_settings = Arc::clone(&config_settings);
+    //
+    //    let handle = thread::spawn(move || match stream {
+    //        Ok(mut stream) => {
+    //            println!("connected");
+    //            //let mut redis_db = db_instances.lock().unwrap();
+    //            event_handler(&mut stream, db_instances, config_settings);
+    //        }
+    //        Err(e) => {
+    //            println!("error: {}", e);
+    //        }
+    //    });
+    //    handles.push(handle);
+    //}
+    //
+    //for handle in handles {
+    //    handle.join().unwrap();
+    //}
 }
 
-fn event_handler(
+async fn event_handler(
     stream: &mut TcpStream,
-    db_instances: Arc<RwLock<RedisData>>,
-    config_settings: Arc<RwLock<RedisConfig>>,
-) {
+    db_instances: Arc<AsyncRwLock<RedisData>>,
+    config_settings: Arc<AsyncRwLock<RedisConfig>>,
+) -> tokio::io::Result<()> {
     let mut buf = [0; 1024];
     loop {
-        let reader = stream.read(&mut buf).unwrap();
+        let reader = stream.read(&mut buf).await.unwrap();
 
         let readable = match str::from_utf8(&buf) {
             Ok(v) => v,
@@ -159,36 +176,41 @@ fn event_handler(
                     let final_str = command.format_response_code(None);
                     stream
                         .write_all(final_str.as_bytes())
+                        .await
                         .expect("failed to write to client");
                 }
 
                 "ping" => {
                     stream
                         .write_all(b"+PONG\r\n")
+                        .await
                         .expect("failed to write to client");
                 }
 
                 "set" => {
-                    let mut db = db_instances.write().unwrap();
+                    let mut db = db_instances.write().await;
                     let response = db.set_value(&command);
                     //println!("{:?}", &db.data);
                     stream
                         .write_all(response.to_string().as_bytes())
+                        .await
                         .expect("failed to write to client");
                 }
 
                 "get" => {
-                    let mut db = db_instances.write().unwrap();
+                    let mut db = db_instances.write().await;
                     match db.get_value(&command) {
                         Some(string_return) => {
                             let parsed_return = command.format_response_code(Some(string_return));
                             stream
                                 .write_all(parsed_return.as_bytes())
+                                .await
                                 .expect("failed to write to client");
                         }
                         None => {
                             stream
                                 .write_all("$-1\r\n".as_bytes())
+                                .await
                                 .expect("failed to write to client");
                         }
                     };
@@ -198,11 +220,12 @@ fn event_handler(
                     if let Some(config_cmd) = command.str_cmd.get(1) {
                         match config_cmd.as_str() {
                             "get" => {
-                                let config = config_settings.read().unwrap();
+                                let config = config_settings.read().await;
                                 let get_string = config.get_config(&command);
                                 println!("{:?}", get_string);
                                 stream
                                     .write_all(get_string.as_bytes())
+                                    .await
                                     .expect("failed to write to client");
                             }
 
@@ -214,7 +237,7 @@ fn event_handler(
                 }
 
                 "keys" => {
-                    let db = db_instances.read().unwrap();
+                    let db = db_instances.read().await;
                     if let Some(config_cmd) = command.str_cmd.get(1) {
                         match config_cmd.as_str() {
                             "*" => {
@@ -225,8 +248,9 @@ fn event_handler(
 
                                         stream
                                             .write_all(final_str.as_bytes())
+                                            .await
                                             .expect("failed to write to client");
-                                        return;
+                                        return Ok(());
                                     }
                                 };
 
@@ -241,12 +265,23 @@ fn event_handler(
 
                                 stream
                                     .write_all(final_str.as_bytes())
+                                    .await
                                     .expect("failed to write to client");
                             }
 
                             _ => {}
                         }
                     }
+                }
+
+                "info" => {
+                    let lst_info = vec!["role:master".to_string()];
+                    let format_string = command.format_response_code(Some(lst_info[0].clone()));
+                    //println!("{:?}", format_string);
+                    stream
+                        .write_all(format_string.as_bytes())
+                        .await
+                        .expect("failed to write to client");
                 }
 
                 _ => {}
@@ -257,4 +292,5 @@ fn event_handler(
             break;
         }
     }
+    Ok(())
 }
