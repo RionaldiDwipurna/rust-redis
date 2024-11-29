@@ -73,7 +73,6 @@ impl RedisCommand {
     }
 
     fn format_response_code(&self, input: Option<String>) -> String {
-        let chars_len: Vec<i32>;
         let str_cmd_to_use = match input {
             Some(s) => {
                 vec![s]
@@ -281,14 +280,48 @@ async fn event_handler(
                 "info" => {
                     let config = config_settings.read().await;
 
+                    let mut db_info: HashMap<String, Vec<String>> = HashMap::new();
+                    let mut lst_info: Vec<String> = vec![];
+
                     let role = match config.get_replicaof() {
-                        Some(value) => "slave".to_string(),
-                        None => "master".to_string(),
+                        Some(_) => "role:slave".to_string(),
+                        None => "role:master".to_string(),
                     };
 
-                    let lst_info = vec![format!("role:{}", role)];
-                    let format_string = command.format_response_code(Some(lst_info[0].clone()));
-                    //println!("{:?}", format_string);
+                    let master_replid =
+                        "master_replid:8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb".to_string();
+                    let master_repl_offset = "master_repl_offset:0".to_string();
+
+                    db_info.insert(
+                        "replication".to_string(),
+                        vec![role, master_replid, master_repl_offset],
+                    );
+
+                    let lst_info = match command.str_cmd.get(1).map(|s| s.as_str()) {
+                        Some("replication") => {
+                            // Return only replication info
+                            db_info.get("replication").cloned().unwrap_or_default()
+                        }
+                        Some(_) => {
+                            eprintln!("Command not found");
+                            Vec::new()
+                        }
+                        None => {
+                            // Return all info
+                            db_info.values().flatten().cloned().collect()
+                        }
+                    };
+                    //println!("{:?}", lst_info);
+                    let total_response = lst_info
+                        .iter()
+                        .map(|item| format!("{}\r\n", item))
+                        .collect::<String>();
+
+                    let total_length = total_response.len();
+
+                    let format_string = format!("${}\r\n{}\r\n", total_length, total_response);
+
+                    println!("{:?}", format_string);
                     stream
                         .write_all(format_string.as_bytes())
                         .await
