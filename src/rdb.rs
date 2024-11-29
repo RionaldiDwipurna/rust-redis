@@ -24,16 +24,28 @@ impl RedisResponse {
     }
 }
 
+pub enum ReplicationRole {
+    Master,
+    Slave,
+}
+
 pub struct RedisData {
     pub data: HashMap<String, String>,
     pub expiry: HashMap<String, std::time::SystemTime>,
+
+    pub replication_role: ReplicationRole,
+    pub host: Option<String>,
+    pub port: Option<u16>,
 }
 
 impl RedisData {
-    pub fn init_db() -> Self {
+    pub fn init_db(role: ReplicationRole, host: Option<String>, port: Option<u16>) -> Self {
         Self {
             data: HashMap::new(),
             expiry: HashMap::new(),
+            replication_role: role,
+            host: host,
+            port: port,
         }
     }
 
@@ -266,5 +278,13 @@ impl RedisData {
         } else {
             Some(keys)
         }
+    }
+
+    pub fn get_role(&self) -> &ReplicationRole {
+        &self.replication_role
+    }
+
+    pub fn get_host_port(&self) -> (Option<String>, Option<u16>) {
+        (self.host.clone(), self.port.clone())
     }
 }

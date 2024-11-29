@@ -10,6 +10,7 @@ use std::hash::Hash;
 use std::io;
 use std::io::{Read, Write};
 //use std::net::{TcpListener, TcpStream};
+use rdb::ReplicationRole;
 use std::result::Result::Ok;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -92,9 +93,36 @@ async fn main() {
     //env::set_var("RUST_BACKTRACE", "full");
     let args: Vec<String> = env::args().collect();
     let config_struct = RedisConfig::parse_argument(args);
-    let mut redis_data = RedisData::init_db();
-    //println!("{:?}", config_struct.config.get("--replicaof").unwrap());
 
+    let (host, port, role) = match config_struct.get_replicaof() {
+        Some(value) => {
+            let part = value.split_whitespace().collect::<Vec<&str>>();
+            let host = part[0].to_string();
+            let port: u16 = part[1].parse().expect("Error when converting port to u32");
+
+            (Some(host), Some(port), ReplicationRole::Slave)
+        }
+        None => (None, None, ReplicationRole::Master),
+    };
+
+    let mut redis_data = RedisData::init_db(role, host, port);
+
+    match redis_data.get_role() {
+        ReplicationRole::Slave => {
+            let (host, port) = redis_data.get_host_port();
+            let mut stream = TcpStream::connect(format!("{}:{}", host.unwrap(), port.unwrap()))
+                .await
+                .expect("failed to connect to master server");
+
+            stream
+                .write_all(b"*1\r\n$4\r\nping\r\n")
+                .await
+                .expect("failed to ping master server");
+        }
+        ReplicationRole::Master => {}
+    }
+
+    //println!("{:?}", config_struct.config.get("--replicaof").unwrap());
     let read_file = redis_data.read_from_file(&config_struct);
 
     //println!("database:");
@@ -321,7 +349,7 @@ async fn event_handler(
 
                     let format_string = format!("${}\r\n{}\r\n", total_length, total_response);
 
-                    println!("{:?}", format_string);
+                    //println!("{:?}", format_string);
                     stream
                         .write_all(format_string.as_bytes())
                         .await
